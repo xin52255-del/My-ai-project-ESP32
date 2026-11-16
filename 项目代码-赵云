@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+ -*- coding: utf-8 -*-
 import pyaudio
 import wave
 import dashscope
@@ -22,8 +22,8 @@ from agentscope_runtime.tools.modelstudio_memory import (
 )
 
 # ========== 请修改这里 ==========
-MY_API_KEY = "sk-91ca359f095a48ceb7d38f3c10a0945a"
-YOUR_APP_ID = "90b412a7de1045cf88b059bb395563ef"
+MY_API_KEY = "sk-xxca359f095a48ceb7d38f3c10a0945a"
+YOUR_APP_ID = "xxb412a7de1045cf88b059bb395563ef"
 QWEN_VOICE_ID = "qwen-tts-vc-bailian-voice-20260520163251988-0e07"
 DEVICE_USER_ID = "my_handan_user_01"
 WAKE_WORD_MODEL = "alexa"
