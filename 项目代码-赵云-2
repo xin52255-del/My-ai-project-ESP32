@@ -1,0 +1,235 @@
+# -*- coding: utf-8 -*-
+import pyaudio
+import wave
+import dashscope
+from dashscope import Application
+from dashscope.audio.tts_v2 import SpeechSynthesizer
+import tempfile
+import os
+import webrtcvad
+import re
+import asyncio
+
+from agentscope_runtime.tools.modelstudio_memory import (
+    AddMemory,
+    AddMemoryInput,
+    SearchMemory,
+    SearchMemoryInput,
+    Message,
+)
+
+# ========== 请修改这里 ==========
+MY_API_KEY = "sk-91ca359f095a48ceb7d38f3c10a0945a"
+YOUR_APP_ID = "90b412a7de1045cf88b059bb395563ef"
+VOICE_CLONE_ID = "cosyvoice-v3.5-plus-bailian-d68c62f6891040718303d7ea7e07f521"
+DEVICE_USER_ID = "my_handan_user_01"
+# ===============================
+
+dashscope.api_key = MY_API_KEY
+
+FORMAT = pyaudio.paInt16
+CHANNELS = 1
+RATE = 16000
+CHUNK_DURATION_MS = 30
+CHUNK = int(RATE * CHUNK_DURATION_MS / 1000)
+
+def record_audio_vad():
+    vad = webrtcvad.Vad()
+    vad.set_mode(3)
+    p = pyaudio.PyAudio()
+    stream = p.open(format=FORMAT,
+                    channels=CHANNELS,
+                    rate=RATE,
+                    input=True,
+                    frames_per_buffer=CHUNK)
+    print("🎤 请说话... (自动检测，静音后自动结束，最长录音30秒)")
+    frames = []
+    triggered = False
+    silence_frames = 0
+    SILENCE_DURATION_SEC = 1.5
+    SILENCE_THRESHOLD = int(SILENCE_DURATION_SEC / (CHUNK_DURATION_MS / 1000.0))
+    MAX_RECORD_SEC = 30
+    max_frames = int(MAX_RECORD_SEC / (CHUNK_DURATION_MS / 1000.0))
+    started = False
+
+    while True:
+        frame = stream.read(CHUNK, exception_on_overflow=False)
+        is_speech = vad.is_speech(frame, RATE)
+        if not triggered:
+            if is_speech:
+                triggered = True
+                started = False
+                if not started:
+                    print("🔴 录音开始...")
+                    started = True
+                frames.append(frame)
+        else:
+            frames.append(frame)
+            if len(frames) >= max_frames:
+                print("⚠️ 达到最大录音时长，自动结束。")
+                break
+            if not is_speech:
+                silence_frames += 1
+                if silence_frames >= SILENCE_THRESHOLD:
+                    print("🔇 静音结束，录音完成。")
+                    break
+            else:
+                silence_frames = 0
+
+    stream.stop_stream()
+    stream.close()
+    p.terminate()
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmpfile:
+        wf = wave.open(tmpfile.name, 'wb')
+        wf.setnchannels(CHANNELS)
+        wf.setsampwidth(p.get_sample_size(FORMAT))
+        wf.setframerate(RATE)
+        wf.writeframes(b''.join(frames))
+        wf.close()
+        return tmpfile.name
+
+def record_audio():
+    return record_audio_vad()
+
+def asr_file(audio_file):
+    print("🎤 正在识别录音...")
+    try:
+        messages = [
+            {"role": "user", "content": [{"audio": audio_file}]}
+        ]
+        response = dashscope.MultiModalConversation.call(
+            model="qwen3-asr-flash",
+            messages=messages,
+            api_key=MY_API_KEY
+        )
+        if response.status_code == 200:
+            text = response.output.choices[0].message.content[0].get('text', '')
+            if text:
+                print(f"📝 识别结果: {text}")
+                return text
+            else:
+                print("⚠️ 未能从响应中提取到有效文本。")
+                return None
+        else:
+            print(f"❌ ASR API调用失败，状态码: {response.status_code}")
+            print(f"   错误信息: {response.message}")
+            return None
+    except Exception as e:
+        print(f"❌ ASR过程发生异常: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+def chat_with_agent(user_text, memory_context=None):
+    print("💬 正在让赵云思考...")
+    if memory_context:
+        final_prompt = f"【以下是你和用户过去交谈中提取的相关记忆，请结合这些记忆回答当前问题】\n{memory_context}\n\n【当前问题】\n{user_text}"
+    else:
+        final_prompt = user_text
+
+    response = Application.call(
+        app_id=YOUR_APP_ID,
+        prompt=final_prompt,
+        is_sequential=False
+    )
+    if response.status_code == 200:
+        reply = response.output.text
+        print(f"🤖 赵云说: {reply}")
+        return reply
+    else:
+        print(f"❌ 智能体错误: {response.message}")
+        return None
+
+def text_to_audio(text):
+    print("🔊 正在合成语音...")
+    cleaned_text = re.sub(r'[（(].*?[）)]', '', text)
+    cleaned_text = re.sub(r'\s+', ' ', cleaned_text).strip()
+    try:
+        synthesizer = SpeechSynthesizer(
+            model="cosyvoice-v3.5-plus",
+            voice=VOICE_CLONE_ID
+        )
+        audio_data = synthesizer.call(cleaned_text)
+        out_file = "output_audio.mp3"
+        with open(out_file, "wb") as f:
+            f.write(audio_data)
+        print(f"✅ 语音已保存: {out_file}")
+        os.system(f"start {out_file}")
+        return out_file
+    except Exception as e:
+        print(f"❌ TTS失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+# ---------- 记忆库相关异步函数 ----------
+async def add_conversation_memory(user_text, assistant_reply):
+    add_memory = AddMemory()
+    try:
+        await add_memory.arun(AddMemoryInput(
+            user_id=DEVICE_USER_ID,
+            messages=[
+                Message(role="user", content=user_text),
+                Message(role="assistant", content=assistant_reply),
+            ]
+        ))
+        print("🧠 记忆已更新")
+    except Exception as e:
+        print(f"❌ 记忆写入失败: {e}")
+    finally:
+        await add_memory.close()
+
+async def get_user_memory(user_text):
+    """检索与当前输入相关的历史记忆，使用 messages 字段传入查询"""
+    search_memory = SearchMemory()
+    try:
+        # 关键修正：使用 messages 而不是 query
+        result = await search_memory.arun(SearchMemoryInput(
+            user_id=DEVICE_USER_ID,
+            messages=[Message(role="user", content=user_text)],   # 当前用户说的话作为查询
+            max_results=3,
+            rewrite=True,
+            rerank=True,
+            similarity_threshold=0.6,
+        ))
+        if result.memory_nodes:
+            print(f"🔍 召回 {len(result.memory_nodes)} 条相关记忆")
+            return "\n".join([node.content for node in result.memory_nodes])
+        else:
+            return None
+    except Exception as e:
+        print(f"❌ 记忆检索失败: {e}")
+        return None
+    finally:
+        await search_memory.close()
+
+# ---------- 异步主循环 ----------
+async def main_async():
+    print("=== 赵云语音对话助手（长期记忆增强版） ===")
+    print("直接说话即可，静音后自动识别并回复，我会记住我们的对话。\n")
+    while True:
+        audio_file = record_audio()
+        print("录音完成，正在识别...")
+        user_text = asr_file(audio_file)
+        try:
+            os.unlink(audio_file)
+        except:
+            pass
+
+        if user_text:
+            # 1. 检索相关记忆
+            memory_context = await get_user_memory(user_text)
+            # 2. 与智能体对话
+            reply = chat_with_agent(user_text, memory_context)
+            if reply:
+                # 3. 合成并播放语音
+                text_to_audio(reply)
+                # 4. 异步存储本轮对话
+                await add_conversation_memory(user_text, reply)
+        else:
+            print("未识别到语音或识别失败，请再试一次。")
+        print("\n")
+
+if __name__ == "__main__":
+    asyncio.run(main_async())
