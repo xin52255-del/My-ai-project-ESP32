@@ -19,8 +19,8 @@ from agentscope_runtime.tools.modelstudio_memory import (
 )
 
 # ========== 请修改这里 ==========
-MY_API_KEY = "sk-91ca359f095a48ceb7d38f3c10a0945a"
-YOUR_APP_ID = "90b412a7de1045cf88b059bb395563ef"
+MY_API_KEY = "sk-xxca359f095a48ceb7d38f3c10a0945a"
+YOUR_APP_ID = "xxb412a7de1045cf88b059bb395563ef"
 VOICE_CLONE_ID = "cosyvoice-v3.5-plus-bailian-d68c62f6891040718303d7ea7e07f521"
 DEVICE_USER_ID = "my_handan_user_01"
 # ===============================
