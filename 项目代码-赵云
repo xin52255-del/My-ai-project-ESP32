@@ -1,0 +1,347 @@
+# -*- coding: utf-8 -*-
+import pyaudio
+import wave
+import dashscope
+from dashscope import Application
+import tempfile
+import os
+import webrtcvad
+import re
+import asyncio
+import base64
+import numpy as np
+from openwakeword import Model
+from openwakeword.utils import download_models
+
+from agentscope_runtime.tools.modelstudio_memory import (
+    AddMemory,
+    AddMemoryInput,
+    SearchMemory,
+    SearchMemoryInput,
+    Message,
+)
+
+# ========== 请修改这里 ==========
+MY_API_KEY = "sk-91ca359f095a48ceb7d38f3c10a0945a"
+YOUR_APP_ID = "90b412a7de1045cf88b059bb395563ef"
+QWEN_VOICE_ID = "qwen-tts-vc-bailian-voice-20260520163251988-0e07"
+DEVICE_USER_ID = "my_handan_user_01"
+WAKE_WORD_MODEL = "alexa"
+# ===============================
+
+dashscope.api_key = MY_API_KEY
+
+FORMAT = pyaudio.paInt16
+CHANNELS = 1
+RATE = 16000
+CHUNK_DURATION_MS = 30
+CHUNK = int(RATE * CHUNK_DURATION_MS / 1000)
+WAKE_WORD_FRAME_SIZE = 1280
+
+EMOTION_MAP = {
+    "happy": "用一种开心、愉悦的语气，语调微微上扬，声音轻快，节奏稍活泼，句末自然轻收。",
+    "excited": "用一种极其兴奋激动的语气，声音洪亮有激情，语速稍快，句末干脆利落。",
+    "sad": "用一种悲伤低落的语气，语速放慢，声音低沉轻柔，句末渐渐弱下去。",
+    "worried": "用一种担心忧虑的语气，气息柔和，语速稍慢，问句时尾音微微上扬。",
+    "angry": "用一种愤怒但克制的语气，声音短促有力，不吼叫，字字清晰，停顿干净。",
+    "serious": "用一种严肃沉稳的语气，语速放慢，字与字之间略有停顿，句末下沉。",
+    "gentle": "用一种非常温柔的语气，音量放轻，气息轻柔缓慢，像在耳边说话。",
+    "nostalgic": "用一种回忆往事的语气，语调柔和遥远，句子间有悠长的停顿感。",
+    "playful": "用一种轻松调侃的语气，语调微扬，带着笑意但不笑出声，节奏轻快。",
+    "nature": "用一种非常自然、生活化的语气，像邻居大哥闲聊，语速不紧不慢，带着随意的笑意，每句话结尾轻收。",
+    "neutral": "用一种自然、沉稳、温暖的语气，语速中等偏慢，句末自然下降，逗号处略有停顿。"
+}
+
+def add_natural_pauses(text):
+    text = text.strip()
+    if text.startswith('<speak>'):
+        return text
+    if re.search(r'<[^>]+>', text):
+        return text
+    text = re.sub(r'……', '<break time="500ms"/>', text)
+    text = re.sub(r'\.{3,}', '<break time="500ms"/>', text)
+    text = re.sub(r'([。！？!?])', r'\1<break time="300ms"/>', text)
+    text = re.sub(r'([，；,;])', r'\1<break time="150ms"/>', text)
+    text = re.sub(r'([、—])', r'\1<break time="100ms"/>', text)
+    text = f"<speak>{text}</speak>"
+    return text
+
+def record_audio_vad():
+    vad = webrtcvad.Vad()
+    vad.set_mode(3)
+    p = pyaudio.PyAudio()
+    stream = p.open(format=FORMAT,
+                    channels=CHANNELS,
+                    rate=RATE,
+                    input=True,
+                    frames_per_buffer=CHUNK)
+    print("🎤 请说话... (自动检测，静音后自动结束，最长录音30秒)")
+    frames = []
+    triggered = False
+    silence_frames = 0
+    SILENCE_DURATION_SEC = 1.5
+    SILENCE_THRESHOLD = int(SILENCE_DURATION_SEC / (CHUNK_DURATION_MS / 1000.0))
+    MAX_RECORD_SEC = 30
+    max_frames = int(MAX_RECORD_SEC / (CHUNK_DURATION_MS / 1000.0))
+    started = False
+
+    while True:
+        frame = stream.read(CHUNK, exception_on_overflow=False)
+        is_speech = vad.is_speech(frame, RATE)
+        if not triggered:
+            if is_speech:
+                triggered = True
+                if not started:
+                    print("🔴 录音开始...")
+                    started = True
+                frames.append(frame)
+        else:
+            frames.append(frame)
+            if len(frames) >= max_frames:
+                print("⚠️ 达到最大录音时长，自动结束。")
+                break
+            if not is_speech:
+                silence_frames += 1
+                if silence_frames >= SILENCE_THRESHOLD:
+                    print("🔇 静音结束，录音完成。")
+                    break
+            else:
+                silence_frames = 0
+
+    stream.stop_stream()
+    stream.close()
+    p.terminate()
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmpfile:
+        wf = wave.open(tmpfile.name, 'wb')
+        wf.setnchannels(CHANNELS)
+        wf.setsampwidth(p.get_sample_size(FORMAT))
+        wf.setframerate(RATE)
+        wf.writeframes(b''.join(frames))
+        wf.close()
+        return tmpfile.name
+
+def record_audio():
+    return record_audio_vad()
+
+def asr_file(audio_file):
+    print("🎤 正在识别录音...")
+    try:
+        messages = [{"role": "user", "content": [{"audio": audio_file}]}]
+        response = dashscope.MultiModalConversation.call(
+            model="qwen3-asr-flash",
+            messages=messages,
+            api_key=MY_API_KEY
+        )
+        if response.status_code == 200:
+            text = response.output.choices[0].message.content[0].get('text', '')
+            if text:
+                print(f"📝 识别结果: {text}")
+                return text
+            else:
+                print("⚠️ 未能从响应中提取到有效文本。")
+                return None
+        else:
+            print(f"❌ ASR API调用失败，状态码: {response.status_code}")
+            print(f"   错误信息: {response.message}")
+            return None
+    except Exception as e:
+        print(f"❌ ASR过程发生异常: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+def chat_with_agent(user_text, memory_context=None):
+    print("💬 正在让赵云思考...")
+    if memory_context:
+        final_prompt = f"【以下是你和用户过去交谈中提取的相关记忆，请结合这些记忆回答当前问题】\n{memory_context}\n\n【当前问题】\n{user_text}"
+    else:
+        final_prompt = user_text
+
+    response = Application.call(
+        app_id=YOUR_APP_ID,
+        prompt=final_prompt,
+        is_sequential=False
+    )
+    if response.status_code == 200:
+        reply = response.output.text
+        print(f"🤖 赵云说: {reply}")
+
+        emotion = "neutral"
+        cleaned_reply = reply.strip()
+        match = re.match(r"^\[(\w+)\]\s*(.*)", cleaned_reply)
+        if match:
+            tag = match.group(1)
+            if tag in EMOTION_MAP:
+                emotion = tag
+                cleaned_reply = match.group(2).strip()
+                print(f"🎭 检测到情感: {emotion}")
+            else:
+                print(f"⚠️ 未知情感标签: [{tag}]，使用 neutral")
+        else:
+            if '<' in cleaned_reply and '>' in cleaned_reply:
+                print("🎭 检测到SSML标签，使用 neutral 情感指令")
+        return cleaned_reply, emotion
+    else:
+        print(f"❌ 智能体错误: {response.message}")
+        return None, "neutral"
+
+def text_to_audio(text, emotion):
+    print("🔊 正在合成语音...")
+    text_to_synthesize = text.strip()
+
+    has_ssml = bool(re.search(r'<(break|emphasis|prosody|say-as|voice)[^>]*>', text_to_synthesize))
+    if has_ssml and not text_to_synthesize.startswith('<speak>'):
+        text_to_synthesize = f"<speak>{text_to_synthesize}</speak>"
+        print("📦 检测到SSML标签，已自动包裹 <speak>")
+    elif not has_ssml:
+        text_to_synthesize = add_natural_pauses(text_to_synthesize)
+
+    voice_instruction = EMOTION_MAP.get(emotion, EMOTION_MAP["neutral"])
+    print(f"🎭 应用指令: {voice_instruction[:40]}...")
+
+    try:
+        response = dashscope.MultiModalConversation.call(
+            model="qwen3-tts-vc-2026-01-22",
+            text=text_to_synthesize,
+            voice=QWEN_VOICE_ID,
+            instructions=voice_instruction
+        )
+        
+        if response.status_code == 200:
+            audio_output = response.output.audio
+            if audio_output is None:
+                print("❌ 未获取到音频数据。")
+                return None
+
+            audio_bytes = None
+            if hasattr(audio_output, 'data') and audio_output.data:
+                data = audio_output.data
+                if isinstance(data, bytes):
+                    audio_bytes = data
+                elif isinstance(data, str):
+                    if data.startswith('data:audio'):
+                        b64_part = data.split(',', 1)[1]
+                        audio_bytes = base64.b64decode(b64_part)
+                    else:
+                        audio_bytes = base64.b64decode(data)
+
+            if audio_bytes is None and hasattr(audio_output, 'url') and audio_output.url:
+                import requests
+                audio_bytes = requests.get(audio_output.url).content
+
+            if audio_bytes is None:
+                try:
+                    audio_bytes = bytes(audio_output)
+                except:
+                    pass
+
+            if audio_bytes is None:
+                print("❌ 无法提取音频数据")
+                return None
+
+            out_file = "output_audio.mp3"
+            with open(out_file, "wb") as f:
+                f.write(audio_bytes)
+            print(f"✅ 语音已保存: {out_file}")
+            os.system(f"start {out_file}")
+            return out_file
+        else:
+            print(f"❌ TTS API调用失败，状态码: {response.status_code}")
+            print(f"   错误信息: {response.message}")
+            return None
+    except Exception as e:
+        print(f"❌ TTS过程发生异常: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+async def add_conversation_memory(user_text, assistant_reply):
+    add_memory = AddMemory()
+    try:
+        await add_memory.arun(AddMemoryInput(
+            user_id=DEVICE_USER_ID,
+            messages=[
+                Message(role="user", content=user_text),
+                Message(role="assistant", content=assistant_reply),
+            ]
+        ))
+        print("🧠 记忆已更新")
+    except Exception as e:
+        print(f"❌ 记忆写入失败: {e}")
+    finally:
+        await add_memory.close()
+
+async def get_user_memory(user_text):
+    search_memory = SearchMemory()
+    try:
+        result = await search_memory.arun(SearchMemoryInput(
+            user_id=DEVICE_USER_ID,
+            messages=[Message(role="user", content=user_text)],
+            max_results=3,
+            rewrite=True,
+            rerank=True,
+            similarity_threshold=0.6,
+        ))
+        if result.memory_nodes:
+            print(f"🔍 召回 {len(result.memory_nodes)} 条相关记忆")
+            return "\n".join([node.content for node in result.memory_nodes])
+        else:
+            return None
+    except Exception as e:
+        print(f"❌ 记忆检索失败: {e}")
+        return None
+    finally:
+        await search_memory.close()
+
+def wait_for_wake_word():
+    download_models()
+    model = Model(wakeword_models=[WAKE_WORD_MODEL], inference_framework="onnx")
+    pa = pyaudio.PyAudio()
+    audio_stream = pa.open(
+        rate=16000,
+        channels=1,
+        format=pyaudio.paInt16,
+        input=True,
+        frames_per_buffer=WAKE_WORD_FRAME_SIZE
+    )
+
+    print(f"💤 等待唤醒词 \"{WAKE_WORD_MODEL}\"... (说 \"{WAKE_WORD_MODEL}\" 唤醒我)")
+    try:
+        while True:
+            pcm = audio_stream.read(WAKE_WORD_FRAME_SIZE, exception_on_overflow=False)
+            audio_data = np.frombuffer(pcm, dtype=np.int16)
+            prediction = model.predict(audio_data)
+            if WAKE_WORD_MODEL in prediction and prediction[WAKE_WORD_MODEL] > 0.5:
+                print("🎯 唤醒词检测到！进入对话模式。")
+                break
+    finally:
+        audio_stream.stop_stream()
+        audio_stream.close()
+        pa.terminate()
+
+async def main_async():
+    print("=== 赵云语音对话助手（唤醒词+自然韵律增强版） ===")
+    print(f"说出 \"{WAKE_WORD_MODEL}\" 唤醒我，然后开始对话。\n")
+    while True:
+        wait_for_wake_word()
+        audio_file = record_audio()
+        print("录音完成，正在识别...")
+        user_text = asr_file(audio_file)
+        try:
+            os.unlink(audio_file)
+        except:
+            pass
+
+        if user_text:
+            memory_context = await get_user_memory(user_text)
+            reply, emotion = chat_with_agent(user_text, memory_context)
+            if reply:
+                text_to_audio(reply, emotion)
+                await add_conversation_memory(user_text, reply)
+        else:
+            print("未识别到语音或识别失败，请再试一次。")
+        print("\n等待下一次唤醒...")
+
+if __name__ == "__main__":
+    asyncio.run(main_async())
